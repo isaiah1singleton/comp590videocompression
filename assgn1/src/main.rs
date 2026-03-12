@@ -18,6 +18,32 @@ use toy_ac::symbol_model::VectorCountSymbolModel;
 
 use ffmpeg_sidecar::event::StreamTypeSpecificData::Video;
 
+fn combined_predictor(
+    r: u32,
+    c: u32,
+    width: u32,
+    prior_frame: &[u8],
+    current_known_frame: &[u8],
+) -> u8 {
+    let idx = (r * width + c) as usize;
+
+    let prior = prior_frame[idx] as u32;
+
+    let left = if c > 0 {
+        current_known_frame[idx - 1] as u32
+    } else {
+        prior
+    };
+
+    let above = if r > 0 {
+        current_known_frame[idx - width as usize] as u32
+    } else {
+        prior
+    };
+
+    ((prior + left + above) / 3) as u8
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure ffmpeg is installed
     ffmpeg_sidecar::download::auto_download().unwrap();
@@ -54,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut output_file_path,
     );
 
-    // Run an FFmpeg command to decode video from inptu_file_path
+    // Run an FFmpeg command to decode video from input_file_path
     // Get output as grayscale (i.e., just the Y plane)
 
     let mut iter = FfmpegCommand::new() // <- Builder API like `std::process::Command`
@@ -64,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .output("-")
         .spawn()? // <- Ordinary `std::process::Child`
         .iter()?; // <- Blocking iterator over logs and output
+
 
     // Figure out geometry of frame.
     let mut width = 0;
@@ -91,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(height != 0);
 
     // Set up initial prior frame as uniform medium gray (y = 128)
-    let mut prior_frame = vec![128 as u8; (width * height) as usize];
+    let mut prior_frame = vec![128u8; (width * height) as usize];
 
     let output_file = match File::create(&output_file_path) {
         Err(_) => panic!("Error opening output file"),
@@ -124,12 +151,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for c in 0..width {
                     let pixel_index = (r * width + c) as usize;
 
-                    // Encode difference with same pixel in prior frame.
+                    let predicted_pixel = combined_predictor(
+                        r,
+                        c,
+                        width,
+                        &prior_frame,
+                        &current_frame,
+                    );
+
+                    // MODIFICATION: Encode difference with prior, left, and right
                     // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
+                    let pixel_difference =
+                        (((current_frame[pixel_index] as i32) - (predicted_pixel as i32)) + 256)
+                            % 256;
 
                     enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
 
@@ -181,27 +215,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
 
         // Set up initial prior frame as uniform medium gray
-        let mut prior_frame = vec![128 as u8; (width * height) as usize];
+        let mut prior_frame = vec![128u8; (width * height) as usize];
 
         'outer_loop: 
         for frame in iter.filter_frames() {
-            if frame.frame_num < skip_count + count {
+           if frame.frame_num < skip_count + count {
                 if verbose {
                     print!("Checking frame: {} ... ", frame.frame_num);
                 }
 
                 let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
 
+                // MODIFICATION: as pixel differences are decoded per frame, add to a buffer
+                let mut reconstructed_frame = vec![0u8; (width * height) as usize];
+
                 // Process pixels in row major order.
                 for r in 0..height {
                     for c in 0..width {
                         let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
+
+                        let predicted_pixel = combined_predictor(
+                            r,
+                            c,
+                            width,
+                            &prior_frame,
+                            &reconstructed_frame,
+                        );
+
+                        let decoded_pixel_difference = dec
+                            .decode(&pixel_difference_pdf, &mut br)
+                            .to_owned();
                         pixel_difference_pdf.incr_count(&decoded_pixel_difference);
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                        let pixel_value =
+                            ((predicted_pixel as i32 + decoded_pixel_difference as i32) % 256)
+                                as u8;
 
-                        if pixel_value != current_frame[pixel_index] as i32 {
+                        reconstructed_frame[pixel_index] = pixel_value;
+
+                        if pixel_value != current_frame[pixel_index] {
                             println!(
                                 " error at ({}, {}), should decode {}, got {}",
                                 c, r, current_frame[pixel_index], pixel_value
@@ -211,8 +263,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
                 println!("correct.");
-                prior_frame = current_frame;
+                prior_frame = reconstructed_frame;
             } else {
                 break 'outer_loop;
             }
